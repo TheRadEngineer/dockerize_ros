@@ -1,0 +1,36 @@
+[Unit]
+Description=ROS1 development container (ros1)
+Documentation=file:///opt/ros-containers/README.md
+Requires=docker.service
+After=docker.service
+# Only one ROS container runs at a time: starting ros2 stops ros1 and vice versa.
+Conflicts=ros2.service
+# Give up after 3 failed starts in 2 minutes instead of looping.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/ros-containers/ros1
+
+# Always start from a fresh container made from ros1:latest.
+ExecStartPre=/opt/ros-containers/ros1/commit.sh prestart
+ExecStart=/usr/bin/docker compose up --no-build --pull never --no-log-prefix
+ExecStartPost=/opt/ros-containers/ros1/commit.sh wait
+
+# reload = checkpoint commit while running; stop/restart/shutdown = commit on stop.
+ExecReload=/opt/ros-containers/ros1/commit.sh checkpoint
+ExecStop=/opt/ros-containers/ros1/commit.sh stop
+
+# `docker compose up` may exit via SIGINT/SIGTERM when the container stops.
+SuccessExitStatus=130 143
+Restart=on-failure
+RestartSec=5
+# Also the time limit for `reload` (systemd has no separate one), and a save
+# of a large image can take several minutes.
+TimeoutStartSec=900
+# Committing (and occasionally squashing) a large image takes time.
+TimeoutStopSec=900
+
+[Install]
+WantedBy=multi-user.target

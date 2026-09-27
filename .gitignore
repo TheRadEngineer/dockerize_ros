@@ -1,0 +1,4 @@
+# Image exports (sync.sh) never belong in git
+*.tar
+*.tar.zst
+*.tar.zst.sha256
