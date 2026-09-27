@@ -7,8 +7,9 @@
 #
 # - Listens on localhost only: not reachable from the network, no password.
 # - Data lives in the Docker volume "ros1_mongo-data": it survives restarts
-#   and image rebuilds, and is NOT part of ros1 saves or sync.sh image exports
-#   (back it up with mongodump).
+#   and image rebuilds and is NOT part of ros1 image saves. `sync.sh export`
+#   backs it up separately with mongodump; `sync.sh import` restores it.
+# - Logs: docker logs ros1-mongo   (kept out of the ros1 journal)
 
 services:
   mongo:
@@ -16,6 +17,7 @@ services:
     container_name: ros1-mongo
     pull_policy: missing
     restart: "no"                 # ros1.service owns the lifecycle
+    attach: false                 # keep its logs out of the ros1 journal: docker logs ros1-mongo
     network_mode: host
     command: ["--bind_ip", "127.0.0.1", "--port", "27017"]
     volumes:

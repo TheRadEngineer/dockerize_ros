@@ -43,8 +43,8 @@ sudo systemctl stop ros1         # save and stop
 systemctl status ros1            # state
 journalctl -u ros1 -b            # log of this boot
 
-./sync.sh export                 # image -> external drive
-./sync.sh import                 # external drive -> image
+./sync.sh export                 # images + database + repo -> external drive
+./sync.sh import                 # external drive -> this PC
 ```
 
 Run `systemctl` and `sync.sh` on the **host**. Inside the container use `sudo`
@@ -57,7 +57,7 @@ for system changes (passwordless).
 ```
 /opt/ros-containers/
 ├── README.md
-├── sync.sh                  # export/import images to external drives
+├── sync.sh                  # backup/restore images, database and repo (external drive)
 └── ros1/
     ├── Dockerfile           # minimal image: user, sudo, locale, GL/Vulkan, name resolution, docker CLI
     ├── entrypoint.sh        # at start: links host services, grants device groups
@@ -147,8 +147,9 @@ sudo systemctl start ros1
 1
 ```
 
-**On another PC with an exported image:** run `./install.sh --enable`, then
-`../sync.sh import` instead of `./build.sh`.
+**On another PC, restoring from a drive:** skip all of the above and see
+[Backup and restore](#backup-and-restore-syncsh) — `sync.sh import` restores
+the repo, images and database and runs `install.sh --enable` itself.
 
 `install.sh` options: `--enable`, `--uninstall` (stops with a save, removes the
 unit and `1`; images and repo are kept), `--help`. It is safe to re-run.
@@ -204,8 +205,9 @@ with `ros1.service`.
 - Shell: `docker exec -it ros1-mongo mongosh` (or `mongosh` inside `1`).
 - Localhost only (not reachable from the network), no password.
 - Data is in the Docker volume `ros1_mongo-data`: it survives restarts and image
-  rebuilds, and is **not** part of saves or `sync.sh` exports. Back it up with
-  `mongodump`; restore with `mongorestore`.
+  rebuilds and is not part of image saves. `sync.sh` exports/imports it as a
+  separate database dump.
+- Logs: `docker logs ros1-mongo` (kept out of the ros1 journal).
 - Don't run `mongod` inside the ros1 container (port clash, and a live
   database would be baked into every save).
 - Not needed? Remove `:compose.mongo.yaml` from `COMPOSE_FILE`.
@@ -279,26 +281,42 @@ Good to know:
 
 ```bash
 cd /opt/ros-containers
-./sync.sh export     # or: ./sync.sh export ros1
-./sync.sh import
+./sync.sh export     # everything -> external drive
+./sync.sh import     # external drive -> this PC
 ```
+
+One export writes three parts to `<drive>/ros-containers/`, each with a `.sha256`:
+
+| File | Contents |
+|---|---|
+| `ros1.tar.zst` | Images: `ros1:latest`, `ros1:base`, `mongo:6.0` (zstd, all cores) |
+| `ros1-mongo.archive.gz` | MongoDB database dump (`mongodump`, consistent while running) |
+| `ros-containers-repo.tar.gz` | This repo, including git history |
+
+plus a copy of `sync.sh`.
 
 - Lists external drives, marks the best one (★): ext4/xfs/btrfs first, then
   exFAT/NTFS, then the fastest port. FAT32 is refused (4 GB file limit). Warns
-  when a drive is on a USB 2 port.
-- Mounts the drive without sudo if needed; offers to eject at the end.
-- **Export** saves the running container first, then writes
-  `<drive>/ros-containers/ros1.tar.zst` (`ros1:latest` + `ros1:base` + companion
-  images such as `mongo:6.0`, zstd on all cores) and a `.sha256`. Database
-  volumes are not included. It writes to `.partial` first, so an
-  interrupted export never damages the previous one. One export per drive
-  (overwritten each time).
-- **Import** verifies the checksum, asks before replacing `ros1:latest` (the
-  current container state is lost), loads the image, removes the replaced one,
-  and restarts ros1 if it was running.
+  when a drive is on a USB 2 port. Mounts without sudo; offers to eject at the end.
+- **Export** saves the running container first. Each part is written as
+  `.partial` and renamed when complete, so an interrupted export never damages
+  the previous one. One export per drive (overwritten each time).
+- **Import** shows what's on the drive, asks which parts to restore (default:
+  all), verifies **all** checksums before changing anything, then:
+  1. repo → `/opt/ros-containers` (the current one is kept as `ros-containers.old-<date>`),
+  2. images → replace `ros1:latest` etc.,
+  3. runs `install.sh --enable`, starts ros1,
+  4. database → `mongorestore --drop` into the running `ros1-mongo`.
+  Missing parts are skipped, so older exports still work.
 
-Restore tested: wiping all Docker images and cache, then `./sync.sh import`,
-gives back the full environment.
+**Fresh PC:** install Docker (+ NVIDIA toolkit, storage setting, see Host setup),
+plug in the drive, then:
+
+```bash
+bash /run/media/$USER/<drive>/ros-containers/sync.sh import
+```
+
+It restores the repo, images and database and installs everything; no build needed.
 
 ---
 
