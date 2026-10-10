@@ -7,9 +7,13 @@ long-lived container managed by systemd and saved into its image automatically.
 | Environment | Image | Service | Shell command |
 |---|---|---|---|
 | ROS1 Noetic (Ubuntu 20.04) | `ros1:latest` | `ros1.service` | `1` |
-| ROS2 | *planned* | `ros2.service` | `2` |
+| ROS2 Jazzy (Ubuntu 24.04) | `ros2:latest` | `ros2.service` | `2` |
 
-Only one environment runs at a time: starting one stops the other.
+The two environments are independent: either, or both, can run at the same
+time. Each has its own image, home directory, MongoDB and workspaces. They
+share the host network, so they can see each other's nodes. Everything below
+is written for `ros1`; `ros2` works the same way (see
+[ROS2 Jazzy](#ros2-jazzy)).
 
 ---
 
@@ -27,6 +31,7 @@ Only one environment runs at a time: starting one stops the other.
 10. [Company compose files and images](#company-compose-files-and-images)
 11. [Changing the repo](#changing-the-repo)
 12. [Troubleshooting](#troubleshooting)
+13. [ROS2 Jazzy](#ros2-jazzy)
 
 ---
 
@@ -47,6 +52,8 @@ journalctl -u ros1 -b            # log of this boot
 ./sync.sh import                 # external drive -> this PC
 ```
 
+For ROS2 use `ros2`/`2` instead (`sudo systemctl start ros2`, `2`, `./sync.sh export ros2`).
+
 Run `systemctl` and `sync.sh` on the **host**. Inside the container use `sudo`
 for system changes (passwordless).
 
@@ -58,6 +65,7 @@ for system changes (passwordless).
 /opt/ros-containers/
 ├── README.md
 ├── sync.sh                  # backup/restore images, database and repo (external drive)
+├── ros2/                    # same files as ros1/, for ROS2 Jazzy (see the ROS2 Jazzy section)
 └── ros1/
     ├── Dockerfile           # minimal image: user, sudo, locale, GL/Vulkan, name resolution, docker CLI
     ├── entrypoint.sh        # at start: links host services, grants device groups
@@ -201,7 +209,8 @@ The ANSCER simulation stores robot data in MongoDB. `compose.mongo.yaml` runs
 **MongoDB 6.0 as a separate container** (`ros1-mongo`) that starts and stops
 with `ros1.service`.
 
-- Connect from the container or the host: `mongodb://localhost:27017`.
+- Connect from the container or the host: `mongodb://localhost:27017`
+  (ros2 has its own, `ros2-mongo`, on `mongodb://localhost:27018`).
 - Shell: `docker exec -it ros1-mongo mongosh` (or `mongosh` inside `1`).
 - Localhost only (not reachable from the network), no password.
 - Data is in the Docker volume `ros1_mongo-data`: it survives restarts and image
@@ -441,7 +450,7 @@ unit with `After=ros1.service` / `Requires=ros1.service`.
 | GUI program shows nothing | Run it via `1 <program>` from a desktop terminal so the session variables are current. |
 | Robot sees topics but no data | Firewall / `ROS_IP`, see Network. |
 | Start fails: `mongo:6.0` image not found | `./install.sh` downloads it (the service never downloads, so it also starts offline). |
-| Simulation can't reach MongoDB | `docker ps` should list `ros1-mongo`; `docker logs ros1-mongo`. Nothing else may use port 27017. |
+| Simulation can't reach MongoDB | `docker ps` should list `ros1-mongo`; `docker logs ros1-mongo`. Nothing else may use port 27017 (ros2-mongo: 27018). |
 | Disk filling up | `docker system df`; `docker image prune` removes unnamed leftovers (keeps `ros1:*`). |
 | Reload/stop is slow | Check `docker info --format '{{.Driver}}'` is `overlay2`. A save after a big install is large once; `restart` after big installs. |
 
@@ -456,9 +465,59 @@ systemctl show ros1 -p TimeoutStartUSec         # 15min (also the reload limit)
 
 ---
 
-## Adding ROS2 later
+## ROS2 Jazzy
 
-Copy `ros1/` to `ros2/`, then change names (`ros1` → `ros2`, `ROS1_*` → `ROS2_*`,
-`1` → `2`), set the base image (e.g. `ubuntu:24.04` for Jazzy), and add
-`Conflicts=ros1.service` to `ros2.service` (ros1 already conflicts with ros2).
-`sync.sh` works with it as `./sync.sh export ros2`.
+`ros2/` is a copy of `ros1/` for ROS 2 Jazzy on Ubuntu 24.04. Same files, same
+behaviour, other names:
+
+| | ros1 | ros2 |
+|---|---|---|
+| Service / container | `ros1` | `ros2` |
+| Images | `ros1:latest`, `ros1:base` | `ros2:latest`, `ros2:base` |
+| Shell command | `1` | `2` |
+| Settings prefix in `.env` | `ROS1_*` | `ROS2_*` |
+| MongoDB | `ros1-mongo`, port 27017 | `ros2-mongo`, port **27018** |
+| Mongo volume | `ros1_mongo-data` | `ros2_mongo-data` |
+| Workspace folder | `~/anscer_ws` | `~/ros2_ws` (Projects, Downloads, Documents, anscer_ws are shared in both) |
+| Setup scripts (`/opt/ros-setup`) | `install-deps-simulation.sh`, `lazyvim-setup.sh` | `lazyvim-setup.sh` |
+
+First time (host):
+
+```bash
+cd /opt/ros-containers/ros2
+./install.sh --enable      # --enable = start at boot (independent of ros1)
+./build.sh                 # builds ros2:base from ubuntu:24.04, creates ros2:latest
+sudo systemctl start ros2
+2
+```
+
+Then inside the container, install ROS 2 Jazzy by following the official guide
+(https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html), and
+optionally Neovim + LazyVim:
+
+```bash
+bash /opt/ros-setup/lazyvim-setup.sh             # optional: Neovim + LazyVim
+```
+
+then `sudo systemctl restart ros2` on the host to save.
+
+Running both at once:
+
+- Both use the host network and `/dev/shm`. ROS 1 talks TCP (roscore on 11311),
+  ROS 2 uses DDS multicast, so they don't collide. Use `ROS_DOMAIN_ID` if you
+  run several ROS 2 systems on one network. Jazzy replaced `ROS_LOCALHOST_ONLY`
+  with `ROS_AUTOMATIC_DISCOVERY_RANGE` (`LOCALHOST` keeps discovery on this PC).
+- Keep ROS 2 workspaces in `~/ros2_ws`, apart from the ROS 1 ones: colcon and
+  catkin both write `build/`.
+- Each container has its own MongoDB on its own port. A simulation running in
+  ros2 must connect to `mongodb://localhost:27018`.
+- There is no ready-made `ros1_bridge` for Noetic + Jazzy (Noetic is Ubuntu
+  20.04, Jazzy 24.04); a bridge would have to be built by hand.
+- GUI programs use Xwayland (`QT_QPA_PLATFORM=xcb`) as in ros1;
+  `2 --nvidia rviz2` renders on the NVIDIA GPU.
+- Shutdown saves both containers (systemd stops them in parallel).
+
+Backup: `./sync.sh export ros2` / `./sync.sh import ros2` write `ros2.tar.zst` and
+`ros2-mongo.archive.gz` next to the ros1 files on the drive. The repo file is
+shared: restoring the repo while the other container runs stops it first (it asks)
+and starts it again afterwards.

@@ -1,0 +1,135 @@
+# ros2 - ROS2 development container that behaves like the host.
+#
+# Normally driven by systemd (ros2.service), not by hand:
+#   sudo systemctl start|stop|restart|reload|status ros2
+# Values like ${ROS2_USER} come from .env in this directory.
+# The NVIDIA GPU is added by compose.nvidia.yaml (see COMPOSE_FILE in .env).
+
+name: ros2
+
+services:
+  ros2:
+    image: ros2:latest            # the committed working image
+    pull_policy: never            # local-only image, never look it up online
+    container_name: ros2
+    restart: "no"                 # systemd owns the lifecycle, not dockerd
+    init: true                    # tini as PID 1: reaps zombies, forwards signals
+    stop_grace_period: 10s
+
+    # --- same kernel view as the host ---------------------------------------
+    network_mode: host            # same interfaces, IPs, routes, VPNs, ports
+    ipc: host                     # shared /dev/shm (ROS/DDS shared memory, X11 MIT-SHM)
+    uts: host                     # same hostname
+    privileged: true              # all devices, all capabilities
+    security_opt:
+      - label=disable             # no SELinux relabelling of host paths (never use :z/:Z)
+
+    # Match Fedora's per-user limits. Docker's default nofile of ~1 billion makes
+    # rosmaster/rospy allocate huge fd tables and run slowly.
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 524288
+
+    # Private, in-memory /tmp and /run (like the host); keeps commits clean.
+    tmpfs:
+      - /tmp:mode=1777,exec
+      - /run:mode=0755,exec
+
+    working_dir: /home/${ROS2_USER}
+
+    environment:
+      # Defaults for processes started without the `2` command. `2` forwards
+      # the live values from your desktop session and overrides these.
+      DISPLAY: ":0"
+      XDG_RUNTIME_DIR: /run/user/${ROS2_UID}
+      # Qt/GTK apps (RViz, Gazebo GUI) are most reliable through Xwayland.
+      QT_QPA_PLATFORM: xcb
+      GDK_BACKEND: x11
+
+    volumes:
+      # --- hardware ---------------------------------------------------------
+      # The live host /dev (not a snapshot): hot-plugged USB/serial/cameras/
+      # joysticks appear immediately.
+      - type: bind
+        source: /dev
+        target: /dev
+
+      # --- host services & desktop session ----------------------------------
+      # Host /run, read-only. entrypoint.sh links D-Bus, udev, avahi and the
+      # docker socket from here. rslave: sockets created later still appear.
+      - type: bind
+        source: /run
+        target: /run/host
+        read_only: true
+        bind:
+          propagation: rslave
+      # Per-user runtime dirs: Wayland/Xwayland auth, PipeWire/Pulse audio,
+      # session D-Bus. rslave: /run/user/<uid> appears when you log in, even
+      # if the container was started at boot before that.
+      - type: bind
+        source: /run/user
+        target: /run/user
+        bind:
+          propagation: rslave
+      - type: bind
+        source: /tmp/.X11-unix
+        target: /tmp/.X11-unix
+      - type: bind
+        source: /etc/localtime
+        target: /etc/localtime
+        read_only: true
+      - type: bind
+        source: /etc/machine-id
+        target: /etc/machine-id
+        read_only: true
+
+      # Setup scripts from this repo (ros2/setup), read-only.
+      # Inside the container: bash /opt/ros-setup/<script>.sh
+      - type: bind
+        source: ./setup
+        target: /opt/ros-setup
+        read_only: true
+
+      # --- shared folders (same path on host and in the container) ----------
+      # Everything else in /home/${ROS2_USER} belongs to the container and is
+      # kept by commits. These folders are never committed or exported.
+      # A missing host folder is an error (Docker won't create it as root).
+      - type: bind
+        source: /home/${ROS2_USER}/Projects
+        target: /home/${ROS2_USER}/Projects
+        bind: {create_host_path: false}
+      - type: bind
+        source: /home/${ROS2_USER}/Downloads
+        target: /home/${ROS2_USER}/Downloads
+        bind: {create_host_path: false}
+      - type: bind
+        source: /home/${ROS2_USER}/Documents
+        target: /home/${ROS2_USER}/Documents
+        bind: {create_host_path: false}
+      - type: bind
+        source: /home/${ROS2_USER}/anscer_ws
+        target: /home/${ROS2_USER}/anscer_ws
+        bind: {create_host_path: false}
+      # ROS 2 workspaces live here, apart from the ROS 1 ones: colcon and catkin
+      # both write build/ and both containers can run at the same time.
+      - type: bind
+        source: /home/${ROS2_USER}/ros2_ws
+        target: /home/${ROS2_USER}/ros2_ws
+        bind: {create_host_path: false}
+
+  # Build-only service: `./build.sh` builds ros2:base from the Dockerfile.
+  # It is never started. ros2:latest is created from it once, then evolves by
+  # commits, so a rebuild never silently replaces your working image.
+  ros2-base:
+    profiles: [build]
+    image: ros2:base
+    pull_policy: build
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${ROS2_BASE_IMAGE}
+        USERNAME: ${ROS2_USER}
+        USER_UID: ${ROS2_UID}
+        USER_GID: ${ROS2_GID}
+        CONTAINER_NAME: ros2

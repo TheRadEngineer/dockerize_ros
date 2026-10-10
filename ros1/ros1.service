@@ -3,8 +3,6 @@ Description=ROS1 development container (ros1)
 Documentation=file:///opt/ros-containers/README.md
 Requires=docker.service
 After=docker.service
-# Only one ROS container runs at a time: starting ros2 stops ros1 and vice versa.
-Conflicts=ros2.service
 # Give up after 3 failed starts in 2 minutes instead of looping.
 StartLimitIntervalSec=120
 StartLimitBurst=3

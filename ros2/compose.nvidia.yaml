@@ -1,0 +1,13 @@
+# NVIDIA GPU (GTX 1650) via CDI. Requires the NVIDIA driver and
+# nvidia-container-toolkit on the host (spec in /etc/cdi or /var/run/cdi).
+# Enabled through COMPOSE_FILE in .env; remove it there to run without it.
+#
+# The desktop still renders on the AMD iGPU by default. Use `1 --nvidia <cmd>`
+# (PRIME render offload) to run a program on the NVIDIA GPU.
+
+services:
+  ros2:
+    devices:
+      - nvidia.com/gpu=all
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: all

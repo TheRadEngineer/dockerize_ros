@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # sync.sh - back up / restore a ROS environment to / from an external drive.
 #
-#   ./sync.sh export [ros1]   write everything to a drive
-#   ./sync.sh import [ros1]   restore from a drive
+#   ./sync.sh export [ros1|ros2]   write everything to a drive (default ros1)
+#   ./sync.sh import [ros1|ros2]   restore from a drive
 #
 # One export = three parts in <drive>/ros-containers/ (each with a .sha256):
 #   ros1.tar.zst                images: ros1:latest, ros1:base, mongo:6.0
 #   ros1-mongo.archive.gz       MongoDB database dump (mongodump)
+# (for ros2: ros2.tar.zst and ros2-mongo.archive.gz, next to the ros1 files)
 #   ros-containers-repo.tar.gz  this repo incl. git history
 # plus a copy of sync.sh, so a fresh PC can run: bash <drive>/ros-containers/sync.sh import
 #
@@ -232,15 +233,25 @@ verify_part() {
 # mongo_up: make sure the MongoDB container runs and answers.
 # Returns 1 if there is no such container.
 MONGO_STARTED_BY_US=false
+MONGO_PORT=27017
+# The port mongod listens on: --port from the container's command, else 27017
+# (ros1-mongo uses 27017, ros2-mongo 27018).
+mongo_port() {
+    local cmd port
+    cmd="$(docker container inspect -f '{{join .Config.Cmd " "}}' "${MONGO_CONTAINER}" 2>/dev/null || true)"
+    port="$(sed -n 's/.*--port[ =]\([0-9][0-9]*\).*/\1/p' <<<"${cmd}")"
+    echo "${port:-27017}"
+}
 mongo_up() {
     docker container inspect "${MONGO_CONTAINER}" >/dev/null 2>&1 || return 1
+    MONGO_PORT="$(mongo_port)"
     if [ "$(docker container inspect -f '{{.State.Running}}' "${MONGO_CONTAINER}")" != true ]; then
         docker start "${MONGO_CONTAINER}" >/dev/null
         MONGO_STARTED_BY_US=true
     fi
     local _
     for _ in $(seq 1 30); do
-        if docker exec "${MONGO_CONTAINER}" mongosh --quiet --eval 'db.runCommand({ping:1}).ok' 2>/dev/null \
+        if docker exec "${MONGO_CONTAINER}" mongosh --quiet --port "${MONGO_PORT}" --eval 'db.runCommand({ping:1}).ok' 2>/dev/null \
             | grep -q 1; then
             return 0
         fi
@@ -256,7 +267,7 @@ mongo_restore_state() {
 }
 
 produce_images() { docker save "${EXPORT_TAGS[@]}" | zstd -T0 -3 --progress -c; }
-produce_mongo()  { docker exec "${MONGO_CONTAINER}" mongodump --archive --gzip --quiet; }
+produce_mongo()  { docker exec "${MONGO_CONTAINER}" mongodump --port "${MONGO_PORT}" --archive --gzip --quiet; }
 produce_repo()   { tar -C "$(dirname "${REPO}")" -czf - "$(basename "${REPO}")"; }
 
 prepare_drive_dir() {
@@ -377,6 +388,22 @@ do_import() {
         sudo systemctl stop "${name}"
     fi
 
+    # Other containers (ros1/ros2) bind-mount folders of the repo. Replacing the
+    # repo underneath a running one would leave it pointing at the old copy.
+    local other stopped_others=()
+    if "${want_repo}"; then
+        for other in ros1 ros2; do
+            [ "${other}" = "${name}" ] && continue
+            if systemctl is-active --quiet "${other}" 2>/dev/null; then
+                warn "${other} is running and uses this repo."
+                confirm "Stop ${other} (saves it) and start it again afterwards?" \
+                    || die "not continuing while ${other} is running"
+                sudo systemctl stop "${other}"
+                stopped_others+=("${other}")
+            fi
+        done
+    fi
+
     # 1. Repo
     if "${want_repo}"; then
         info "Restoring repo"
@@ -430,9 +457,13 @@ do_import() {
     if "${want_db}"; then
         info "Restoring MongoDB database"
         mongo_up || die "no ${MONGO_CONTAINER} container; is compose.mongo.yaml enabled in .env?"
-        docker exec -i "${MONGO_CONTAINER}" mongorestore --archive --gzip --drop --quiet < "${f_db}"
+        docker exec -i "${MONGO_CONTAINER}" mongorestore --port "${MONGO_PORT}" --archive --gzip --drop --quiet < "${f_db}"
         ok "database restored"
     fi
+
+    for other in "${stopped_others[@]}"; do
+        sudo systemctl start "${other}" && ok "${other} started again"
+    done
 
     ok "import finished"
     eject_drive

@@ -1,0 +1,29 @@
+# MongoDB 6.0 for the ANSCER simulation (robot data is stored in MongoDB).
+# Enabled through COMPOSE_FILE in .env; runs next to ros2 as its own container
+# and starts/stops together with ros2.service.
+#
+#   connect:   mongodb://localhost:27018   (from the container and the host)
+#   shell:     docker exec -it ros2-mongo mongosh
+#
+# - Port 27018, because ros1-mongo uses 27017 and both containers can run at once.
+# - Listens on localhost only: not reachable from the network, no password.
+# - Data lives in the Docker volume "ros2_mongo-data": it survives restarts
+#   and image rebuilds and is NOT part of ros2 image saves. `sync.sh export`
+#   backs it up separately with mongodump; `sync.sh import` restores it.
+# - Logs: docker logs ros2-mongo   (kept out of the ros2 journal)
+
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: ros2-mongo
+    pull_policy: missing
+    restart: "no"                 # ros2.service owns the lifecycle
+    attach: false                 # keep its logs out of the ros2 journal: docker logs ros2-mongo
+    network_mode: host
+    command: ["--bind_ip", "127.0.0.1", "--port", "27018"]
+    volumes:
+      - mongo-data:/data/db
+    stop_grace_period: 30s        # let MongoDB shut down cleanly
+
+volumes:
+  mongo-data:
