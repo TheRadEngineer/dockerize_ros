@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # sync.sh - back up / restore a ROS environment to / from an external drive.
 #
-#   ./sync.sh export [ros1|ros2]   write everything to a drive (default ros1)
-#   ./sync.sh import [ros1|ros2]   restore from a drive
+#   ./sync.sh export [ros1 ros2 | all]   write everything to a drive (no name = all)
+#   ./sync.sh import [ros1 ros2 | all]   restore from a drive      (no name = all)
 #
-# One export = three parts in <drive>/ros-containers/ (each with a .sha256):
+# An export writes to <drive>/ros-containers/ (each file has a .sha256):
 #   ros1.tar.zst                images: ros1:latest, ros1:base, mongo:6.0
 #   ros1-mongo.archive.gz       MongoDB database dump (mongodump)
-# (for ros2: ros2.tar.zst and ros2-mongo.archive.gz, next to the ros1 files)
-#   ros-containers-repo.tar.gz  this repo incl. git history
+#   ros2.tar.zst, ros2-mongo.archive.gz   the same for ros2
+#   ros-containers-repo.tar.gz  this repo incl. git history (once)
 # plus a copy of sync.sh, so a fresh PC can run: bash <drive>/ros-containers/sync.sh import
 #
 # Lists the external drives, recommends the best one, mounts it if needed
@@ -30,22 +30,39 @@ confirm() { local a; read -r -p "$1 [y/N] " a; [[ "${a}" =~ ^[Yy]$ ]]; }
 confirm_yes() { local a; read -r -p "$1 [Y/n] " a; [[ ! "${a}" =~ ^[Nn]$ ]]; }
 image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
 
-usage() { sed -n '2,18s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
 
 # --- arguments and checks ----------------------------------------------------
 action="${1:-}"
-name="${2:-ros1}"
 case "${action}" in
-    export|import) ;;
+    export|import) shift ;;
     -h|--help|"") usage; exit 0 ;;
     *) usage; exit 2 ;;
 esac
+REQUESTED=("$@")            # container names, or "all"; none given = all
+for arg in "${REQUESTED[@]}"; do
+    case "${arg}" in
+        -h|--help) usage; exit 0 ;;
+        -*)        usage; exit 2 ;;
+    esac
+done
 
 # The repo is the folder this script is in, or /opt/ros-containers when the
 # script is run from the drive copy (e.g. on a fresh PC).
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-if [ -d "${SCRIPT_DIR}/${name}" ]; then REPO="${SCRIPT_DIR}"; else REPO="${TARGET_REPO}"; fi
-MONGO_CONTAINER="${name}-mongo"
+if compgen -G "${SCRIPT_DIR}/*/compose.yaml" >/dev/null; then REPO="${SCRIPT_DIR}"; else REPO="${TARGET_REPO}"; fi
+
+# The container being worked on (set by use_name).
+name=""
+MONGO_CONTAINER=""
+MONGO_PORT=27017
+MONGO_STARTED_BY_US=false
+use_name() {
+    name="$1"
+    MONGO_CONTAINER="${name}-mongo"
+    MONGO_PORT=27017
+    MONGO_STARTED_BY_US=false
+}
 
 [ -z "${CONTAINER_NAME:-}" ] || die "run this on the host, not inside the container"
 [ "${EUID}" -ne 0 ] || die "run as your user, not root (sudo is used when needed)"
@@ -53,9 +70,30 @@ docker info >/dev/null 2>&1 || die "cannot talk to Docker (running? in the docke
 for tool in zstd udisksctl lsblk numfmt; do
     command -v "${tool}" >/dev/null || die "'${tool}' is missing (sudo dnf install ${tool})"
 done
-if [ "${action}" = export ]; then
-    [ -d "${REPO}/${name}" ] || die "unknown container '${name}' (no ${REPO}/${name} folder)"
-fi
+
+# repo_names: the containers defined in the repo (folders with a compose.yaml)
+repo_names() {
+    local d
+    for d in "${REPO}"/*/; do
+        if [ -f "${d}compose.yaml" ]; then basename "${d}"; fi
+    done
+}
+NAMES=()
+add_unique() {
+    local n
+    for n in "${NAMES[@]}"; do
+        if [ "${n}" = "$1" ]; then return 0; fi
+    done
+    NAMES+=("$1")
+}
+in_list() {   # in_list WORD LIST...
+    local w="$1" x
+    shift
+    for x in "$@"; do
+        if [ "${x}" = "${w}" ]; then return 0; fi
+    done
+    return 1
+}
 
 # --- drive discovery -----------------------------------------------------------
 # field KEY LINE: value of KEY="..." in one line of `lsblk -P` output
@@ -232,8 +270,6 @@ verify_part() {
 
 # mongo_up: make sure the MongoDB container runs and answers.
 # Returns 1 if there is no such container.
-MONGO_STARTED_BY_US=false
-MONGO_PORT=27017
 # The port mongod listens on: --port from the container's command, else 27017
 # (ros1-mongo uses 27017, ros2-mongo 27018).
 mongo_port() {
@@ -282,13 +318,41 @@ prepare_drive_dir() {
 }
 
 # --- export --------------------------------------------------------------------
-do_export() {
-    [ -n "$(image_id "${name}:latest")" ] || die "image ${name}:latest not found"
+# --- export ------------------------------------------------------------------
+# resolve_export_names: NAMES = the containers to export. "all" (or no name)
+# means every container in the repo that has an image on this PC.
+resolve_export_names() {
+    NAMES=()
+    local a n
+    local -a want=("${REQUESTED[@]}")
+    [ "${#want[@]}" -gt 0 ] || want=(all)
+    for a in "${want[@]}"; do
+        if [ "${a}" = all ]; then
+            while IFS= read -r n; do
+                if [ -n "$(image_id "${n}:latest")" ]; then
+                    add_unique "${n}"
+                else
+                    warn "${n}: no ${n}:latest image on this PC, skipped"
+                fi
+            done < <(repo_names)
+        else
+            [ -f "${REPO}/${a}/compose.yaml" ] || die "unknown container '${a}' (no ${REPO}/${a} folder)"
+            [ -n "$(image_id "${a}:latest")" ] || die "image ${a}:latest not found"
+            add_unique "${a}"
+        fi
+    done
+    [ "${#NAMES[@]}" -gt 0 ] || die "nothing to export"
+}
 
-    choose_drive
-    mount_drive
-    prepare_drive_dir
+# export_one NAME: save the running container, then write its images and database.
+export_one() {
+    use_name "$1"
+    local img f_img f_db size avail
+    f_img="${DIR}/${name}.tar.zst"
+    f_db="${DIR}/${MONGO_CONTAINER}.archive.gz"
 
+    echo
+    info "[${name}]"
     if systemctl is-active --quiet "${name}"; then
         info "Saving the running ${name} container first"
         sudo systemctl reload "${name}"
@@ -298,13 +362,11 @@ do_export() {
     # so a restore also works offline.
     EXPORT_TAGS=("${name}:latest")
     [ -n "$(image_id "${name}:base")" ] && EXPORT_TAGS+=("${name}:base")
-    local img
     for img in $(cd "${REPO}/${name}" && docker compose config --images 2>/dev/null | sort -u); do
         case "${img}" in "${name}":*) continue ;; esac
         [ -n "$(image_id "${img}")" ] && EXPORT_TAGS+=("${img}")
     done
 
-    local size avail
     size="$(docker image inspect -f '{{.Size}}' "${name}:latest")"
     avail="$(df -B1 --output=avail "${DIR}" | tail -n1 | tr -d ' ')"
     info "Image size $(human "${size}") (compressed to roughly half); free on drive $(human "${avail}")"
@@ -313,16 +375,11 @@ do_export() {
         confirm "Try anyway?" || exit 1
     fi
 
-    local start=$SECONDS
-    local f_img="${DIR}/${name}.tar.zst"
-    local f_db="${DIR}/${MONGO_CONTAINER}.archive.gz"
-    local f_repo="${DIR}/${REPO_FILE}"
-
-    info "1/3 Images: ${EXPORT_TAGS[*]}"
+    info "Images: ${EXPORT_TAGS[*]}"
     save_part "${f_img}" produce_images
     ok "$(basename "${f_img}")  $(human "$(stat -c %s "${f_img}")")"
 
-    info "2/3 MongoDB database"
+    info "MongoDB database"
     if mongo_up; then
         save_part "${f_db}" produce_mongo
         mongo_restore_state
@@ -330,8 +387,23 @@ do_export() {
     else
         warn "no ${MONGO_CONTAINER} container on this PC, database skipped"
     fi
+}
 
-    info "3/3 Repo ${REPO} (with git history)"
+do_export() {
+    resolve_export_names           # fail early, before touching the drive
+    info "Exporting: ${NAMES[*]}"
+
+    choose_drive
+    mount_drive
+    prepare_drive_dir
+
+    local start=$SECONDS n f_repo="${DIR}/${REPO_FILE}"
+    for n in "${NAMES[@]}"; do
+        export_one "${n}"
+    done
+
+    echo
+    info "Repo ${REPO} (with git history)"
     save_part "${f_repo}" produce_repo
     cp -f "${REPO}/sync.sh" "${DIR}/sync.sh"
     ok "$(basename "${f_repo}")  $(human "$(stat -c %s "${f_repo}")")  (+ sync.sh)"
@@ -340,60 +412,111 @@ do_export() {
     eject_drive
 }
 
-# --- import --------------------------------------------------------------------
+# --- import ---------------------------------------------------------------------
+# resolve_import_names: NAMES = the containers to restore. "all" (or no name)
+# means every container that has an images or database file on the drive.
+resolve_import_names() {
+    NAMES=()
+    local a f n
+    local -a want=("${REQUESTED[@]}")
+    [ "${#want[@]}" -gt 0 ] || want=(all)
+    for a in "${want[@]}"; do
+        if [ "${a}" = all ]; then
+            for f in "${DIR}"/*.tar.zst "${DIR}"/*-mongo.archive.gz; do
+                [ -f "${f}" ] || continue
+                n="$(basename "${f}")"
+                n="${n%.tar.zst}"
+                n="${n%-mongo.archive.gz}"
+                add_unique "${n}"
+            done
+        else
+            if [ ! -f "${DIR}/${a}.tar.zst" ] && [ ! -f "${DIR}/${a}-mongo.archive.gz" ]; then
+                die "nothing for '${a}' on the drive"
+            fi
+            add_unique "${a}"
+        fi
+    done
+}
+
+show_file() {   # show_file FILE: one line of the "found on the drive" list
+    if [ -f "$1" ]; then
+        printf '    %-32s %8s  %s\n' "$(basename "$1")" \
+            "$(human "$(stat -c %s "$1")")" "$(date -r "$1" '+%Y-%m-%d %H:%M')"
+    else
+        printf '    %-32s %8s\n' "$(basename "$1")" "missing"
+    fi
+}
+
 do_import() {
     choose_drive
     mount_drive
     DIR="${MNT}/${DRIVE_DIR}"
     [ -d "${DIR}" ] || die "no ${DRIVE_DIR}/ folder on ${MNT}; nothing exported to this drive yet"
+    resolve_import_names
 
-    local f_img="${DIR}/${name}.tar.zst"
-    local f_db="${DIR}/${MONGO_CONTAINER}.archive.gz"
-    local f_repo="${DIR}/${REPO_FILE}"
+    local f_repo="${DIR}/${REPO_FILE}" n
+    [ -f "${f_repo}" ] || [ "${#NAMES[@]}" -gt 0 ] || die "nothing to restore found on the drive"
 
     # What's on the drive, and what should be restored?
     echo
     info "Found on the drive:"
-    local want_img=false want_db=false want_repo=false f
-    for f in "${f_repo}" "${f_img}" "${f_db}"; do
-        if [ -f "${f}" ]; then
-            printf '    %-32s %8s  %s\n' "$(basename "${f}")" \
-                "$(human "$(stat -c %s "${f}")")" "$(date -r "${f}" '+%Y-%m-%d %H:%M')"
-        else
-            printf '    %-32s %8s\n' "$(basename "${f}")" "missing"
-        fi
+    show_file "${f_repo}"
+    for n in "${NAMES[@]}"; do
+        show_file "${DIR}/${n}.tar.zst"
+        show_file "${DIR}/${n}-mongo.archive.gz"
     done
     echo
-    [ -f "${f_repo}" ] && confirm_yes "Restore the repo to ${TARGET_REPO}?" && want_repo=true
-    [ -f "${f_img}" ]  && confirm_yes "Restore the images (${name}:latest, ...)?" && want_img=true
-    [ -f "${f_db}" ]   && confirm_yes "Restore the MongoDB database?" && want_db=true
-    "${want_repo}" || "${want_img}" || "${want_db}" || die "nothing selected"
+
+    local want_repo=false
+    local -A want_img=() want_db=() was_active=()
+    local -a SELECTED=()
+    if [ -f "${f_repo}" ] && confirm_yes "Restore the repo to ${TARGET_REPO}?"; then want_repo=true; fi
+    for n in "${NAMES[@]}"; do
+        if [ -f "${DIR}/${n}.tar.zst" ] && confirm_yes "Restore the ${n} images (${n}:latest, ...)?"; then
+            want_img[${n}]=true
+        fi
+        if [ -f "${DIR}/${n}-mongo.archive.gz" ] && confirm_yes "Restore the ${n} MongoDB database?"; then
+            want_db[${n}]=true
+        fi
+        if [ "${want_img[${n}]:-false}" = true ] || [ "${want_db[${n}]:-false}" = true ]; then
+            SELECTED+=("${n}")
+        fi
+    done
+    "${want_repo}" || [ "${#SELECTED[@]}" -gt 0 ] || die "nothing selected"
 
     # Verify everything before changing anything.
     info "Verifying checksums"
     "${want_repo}" && verify_part "${f_repo}"
-    "${want_img}"  && verify_part "${f_img}"
-    "${want_db}"   && verify_part "${f_db}"
+    for n in "${SELECTED[@]}"; do
+        [ "${want_img[${n}]:-false}" = true ] && verify_part "${DIR}/${n}.tar.zst"
+        [ "${want_db[${n}]:-false}" = true ] && verify_part "${DIR}/${n}-mongo.archive.gz"
+    done
 
     echo
     "${want_repo}" && warn "The repo at ${TARGET_REPO} will be replaced (the current one is kept as ${TARGET_REPO}.old-<date>)."
-    "${want_img}"  && warn "${name}:latest will be replaced: changes not in this export are lost."
-    "${want_db}"   && warn "The MongoDB database will be replaced by the one from the drive."
+    for n in "${SELECTED[@]}"; do
+        [ "${want_img[${n}]:-false}" = true ] && warn "${n}:latest will be replaced: changes not in this export are lost."
+        [ "${want_db[${n}]:-false}" = true ] && warn "The ${n} MongoDB database will be replaced by the one from the drive."
+    done
     confirm "Continue?" || exit 1
 
-    local was_active=false
-    if systemctl is-active --quiet "${name}"; then
-        was_active=true
-        info "Stopping ${name}"
-        sudo systemctl stop "${name}"
-    fi
+    # Stop the containers being restored (a stop saves them).
+    for n in "${SELECTED[@]}"; do
+        was_active[${n}]=false
+        if systemctl is-active --quiet "${n}"; then
+            was_active[${n}]=true
+            info "Stopping ${n}"
+            sudo systemctl stop "${n}"
+        fi
+    done
 
-    # Other containers (ros1/ros2) bind-mount folders of the repo. Replacing the
-    # repo underneath a running one would leave it pointing at the old copy.
-    local other stopped_others=()
+    # Other containers bind-mount folders of the repo. Replacing the repo
+    # underneath a running one would leave it pointing at the old copy.
+    local other
+    local -a stopped_others=()
     if "${want_repo}"; then
-        for other in ros1 ros2; do
-            [ "${other}" = "${name}" ] && continue
+        while IFS= read -r other; do
+            in_list "${other}" "${SELECTED[@]}" && continue
             if systemctl is-active --quiet "${other}" 2>/dev/null; then
                 warn "${other} is running and uses this repo."
                 confirm "Stop ${other} (saves it) and start it again afterwards?" \
@@ -401,18 +524,17 @@ do_import() {
                 sudo systemctl stop "${other}"
                 stopped_others+=("${other}")
             fi
-        done
+        done < <(repo_names)
     fi
 
     # 1. Repo
     if "${want_repo}"; then
         info "Restoring repo"
-        local tmp
+        local tmp backup
         tmp="$(mktemp -d)"
         tar -xzf "${f_repo}" -C "${tmp}"
         [ -d "${tmp}/$(basename "${TARGET_REPO}")" ] || die "unexpected repo archive layout"
         if [ -e "${TARGET_REPO}" ]; then
-            local backup
             backup="${TARGET_REPO}.old-$(date +%Y%m%d-%H%M%S)"
             sudo mv "${TARGET_REPO}" "${backup}"
             ok "previous repo kept as ${backup}"
@@ -425,41 +547,57 @@ do_import() {
     fi
 
     # 2. Images
-    if "${want_img}"; then
-        info "Loading images"
-        local old_latest old_base old
-        old_latest="$(image_id "${name}:latest")"
-        old_base="$(image_id "${name}:base")"
-        zstd -dc --progress "${f_img}" | docker load
+    local old_latest old_base old
+    for n in "${SELECTED[@]}"; do
+        [ "${want_img[${n}]:-false}" = true ] || continue
+        info "[${n}] Loading images"
+        old_latest="$(image_id "${n}:latest")"
+        old_base="$(image_id "${n}:base")"
+        zstd -dc --progress "${DIR}/${n}.tar.zst" | docker load
         for old in "${old_latest}" "${old_base}"; do
-            if [ -n "${old}" ] && [ "${old}" != "$(image_id "${name}:latest")" ] \
-               && [ "${old}" != "$(image_id "${name}:base")" ]; then
+            if [ -n "${old}" ] && [ "${old}" != "$(image_id "${n}:latest")" ] \
+               && [ "${old}" != "$(image_id "${n}:base")" ]; then
                 docker image rm "${old}" >/dev/null 2>&1 || true
             fi
         done
-        ok "images loaded"
-    fi
+        ok "[${n}] images loaded"
+    done
 
-    # Hook the (restored) repo into this PC: unit, `1`, folders, SELinux.
-    if "${want_repo}" || ! systemctl cat "${name}" >/dev/null 2>&1; then
-        [ -x "${REPO}/${name}/install.sh" ] \
-            || die "no repo at ${REPO}; run the import again and restore the repo too"
-        info "Running install.sh"
-        (cd "${REPO}/${name}" && ./install.sh --enable)
+    # Hook the (restored) repo into this PC: unit, `1`/`2`, folders, SELinux.
+    local -a targets=("${SELECTED[@]}")
+    if [ "${#targets[@]}" -eq 0 ] && "${want_repo}"; then
+        while IFS= read -r n; do
+            if systemctl cat "${n}" >/dev/null 2>&1; then targets+=("${n}"); fi
+        done < <(repo_names)
     fi
+    for n in "${targets[@]}"; do
+        if "${want_repo}" || ! systemctl cat "${n}" >/dev/null 2>&1; then
+            [ -x "${REPO}/${n}/install.sh" ] \
+                || die "no ${n} folder in the repo at ${REPO}; run the import again and restore the repo too"
+            info "[${n}] Running install.sh"
+            (cd "${REPO}/${n}" && ./install.sh --enable)
+        fi
+    done
 
-    # 3. Start, then restore the database into the running MongoDB.
-    if "${want_db}" || "${was_active}" || confirm "Start ${name} now?"; then
-        "${want_db}" && ! "${was_active}" && info "Starting ${name} (needed for the database restore)"
-        sudo systemctl start "${name}"
-        ok "${name} started"
-    fi
-    if "${want_db}"; then
-        info "Restoring MongoDB database"
-        mongo_up || die "no ${MONGO_CONTAINER} container; is compose.mongo.yaml enabled in .env?"
-        docker exec -i "${MONGO_CONTAINER}" mongorestore --port "${MONGO_PORT}" --archive --gzip --drop --quiet < "${f_db}"
-        ok "database restored"
-    fi
+    # 3. Start, then restore the databases into the running MongoDB containers.
+    for n in "${SELECTED[@]}"; do
+        if [ "${want_db[${n}]:-false}" = true ] || [ "${was_active[${n}]}" = true ] \
+           || confirm "Start ${n} now?"; then
+            if [ "${want_db[${n}]:-false}" = true ] && [ "${was_active[${n}]}" != true ]; then
+                info "Starting ${n} (needed for the database restore)"
+            fi
+            sudo systemctl start "${n}"
+            ok "${n} started"
+        fi
+        if [ "${want_db[${n}]:-false}" = true ]; then
+            use_name "${n}"
+            info "[${n}] Restoring MongoDB database"
+            mongo_up || die "no ${MONGO_CONTAINER} container; is compose.mongo.yaml enabled in ${n}/.env?"
+            docker exec -i "${MONGO_CONTAINER}" mongorestore --port "${MONGO_PORT}" --archive --gzip --drop --quiet \
+                < "${DIR}/${n}-mongo.archive.gz"
+            ok "[${n}] database restored"
+        fi
+    done
 
     for other in "${stopped_others[@]}"; do
         sudo systemctl start "${other}" && ok "${other} started again"

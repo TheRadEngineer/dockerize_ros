@@ -48,11 +48,12 @@ sudo systemctl stop ros1         # save and stop
 systemctl status ros1            # state
 journalctl -u ros1 -b            # log of this boot
 
-./sync.sh export                 # images + database + repo -> external drive
+./sync.sh export                 # everything (ros1 + ros2 + repo) -> external drive
 ./sync.sh import                 # external drive -> this PC
+./sync.sh export ros1            # or name the ones you want: ros1, ros2, ros1 ros2
 ```
 
-For ROS2 use `ros2`/`2` instead (`sudo systemctl start ros2`, `2`, `./sync.sh export ros2`).
+For ROS2 use `ros2`/`2` instead (`sudo systemctl start ros2`, `2`).
 
 Run `systemctl` and `sync.sh` on the **host**. Inside the container use `sudo`
 for system changes (passwordless).
@@ -290,17 +291,25 @@ Good to know:
 
 ```bash
 cd /opt/ros-containers
-./sync.sh export     # everything -> external drive
-./sync.sh import     # external drive -> this PC
+./sync.sh export                # everything -> external drive (same as: export all)
+./sync.sh import                # external drive -> this PC     (same as: import all)
+./sync.sh export ros1           # only ros1 (plus the repo)
+./sync.sh export ros1 ros2      # several, one drive selection
 ```
 
-One export writes three parts to `<drive>/ros-containers/`, each with a `.sha256`:
+Names are the container folders (`ros1`, `ros2`, ...) or `all`. With no name,
+`export` takes every container that has an image on this PC (others are skipped
+with a note) and `import` takes every container that is on the drive. You pick
+the drive once.
+
+An export writes to `<drive>/ros-containers/`, each file with a `.sha256`:
 
 | File | Contents |
 |---|---|
 | `ros1.tar.zst` | Images: `ros1:latest`, `ros1:base`, `mongo:6.0` (zstd, all cores) |
 | `ros1-mongo.archive.gz` | MongoDB database dump (`mongodump`, consistent while running) |
-| `ros-containers-repo.tar.gz` | This repo, including git history |
+| `ros2.tar.zst`, `ros2-mongo.archive.gz` | The same for ros2 |
+| `ros-containers-repo.tar.gz` | This repo, including git history (written once) |
 
 plus a copy of `sync.sh`.
 
@@ -313,10 +322,12 @@ plus a copy of `sync.sh`.
 - **Import** shows what's on the drive, asks which parts to restore (default:
   all), verifies **all** checksums before changing anything, then:
   1. repo → `/opt/ros-containers` (the current one is kept as `ros-containers.old-<date>`),
-  2. images → replace `ros1:latest` etc.,
-  3. runs `install.sh --enable`, starts ros1,
-  4. database → `mongorestore --drop` into the running `ros1-mongo`.
-  Missing parts are skipped, so older exports still work.
+  2. images → replace `ros1:latest` etc. (for each container chosen),
+  3. runs `install.sh --enable` and starts each container,
+  4. databases → `mongorestore --drop` into each running `<name>-mongo`.
+  Missing parts are skipped, so older exports still work. Restoring the repo
+  while a container you did *not* choose is running stops it first (it asks)
+  and starts it again afterwards.
 
 **Fresh PC:** install Docker (+ NVIDIA toolkit, storage setting, see Host setup),
 plug in the drive, then:
@@ -517,7 +528,6 @@ Running both at once:
   `2 --nvidia rviz2` renders on the NVIDIA GPU.
 - Shutdown saves both containers (systemd stops them in parallel).
 
-Backup: `./sync.sh export ros2` / `./sync.sh import ros2` write `ros2.tar.zst` and
-`ros2-mongo.archive.gz` next to the ros1 files on the drive. The repo file is
-shared: restoring the repo while the other container runs stops it first (it asks)
-and starts it again afterwards.
+Backup: `./sync.sh export` takes both (or `./sync.sh export ros2` only this one);
+`ros2.tar.zst` and `ros2-mongo.archive.gz` are written next to the ros1 files on
+the drive. Import works the same way.
